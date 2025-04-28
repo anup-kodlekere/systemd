@@ -113,6 +113,7 @@ typedef enum MountImageType {
 typedef struct MountImage {
         char *source;
         char *destination; /* Unused if MountImageType == MOUNT_IMAGE_EXTENSION */
+        int source_fd; /* Pre-opened RootImage= or ExtensionImages= */
         LIST_HEAD(MountOptions, mount_options);
         bool ignore_enoent;
         MountImageType type;
@@ -123,6 +124,7 @@ typedef struct NamespaceParameters {
 
         const char *root_directory;
         const char *root_image;
+        int root_image_fd;
         const MountOptions *root_image_options;
         const ImagePolicy *root_image_policy;
 

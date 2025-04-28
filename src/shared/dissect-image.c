@@ -452,7 +452,7 @@ static void check_partition_flags(
         }
 }
 
-static int dissected_image_new(const char *path, DissectedImage **ret) {
+int dissected_image_new(const char *path, DissectedImage **ret) {
         _cleanup_(dissected_image_unrefp) DissectedImage *m = NULL;
         _cleanup_free_ char *name = NULL;
         int r;
@@ -4280,6 +4280,7 @@ static bool mount_options_relax_extension_release_checks(const MountOptions *opt
 
 int verity_dissect_and_mount(
                 int src_fd,
+                int mount_fd,
                 const char *src,
                 const char *dest,
                 const MountOptions *options,
@@ -4307,7 +4308,7 @@ int verity_dissect_and_mount(
         /* We might get an FD for the image, but we use the original path to look for the dm-verity files.
          * The caller might also give us a pre-loaded VeritySettings, in which case we just use it. It will
          * also be extended, as dissected_image_load_verity_sig_partition() is invoked. */
-        if (!verity) {
+        if (mount_fd < 0 && !verity) {
                 r = verity_settings_load(&local_verity, src, NULL, NULL);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to load root hash: %m");
@@ -4316,60 +4317,79 @@ int verity_dissect_and_mount(
         }
 
         dissect_image_flags =
+                (mount_fd >= 0 ? DISSECT_IMAGE_MOUNT_ROOT_ONLY : 0) |
                 (verity->data_path ? DISSECT_IMAGE_NO_PARTITION_TABLE : 0) |
                 (relax_extension_release_check ? DISSECT_IMAGE_RELAX_EXTENSION_CHECK : 0) |
                 DISSECT_IMAGE_ADD_PARTITION_DEVICES |
                 DISSECT_IMAGE_PIN_PARTITION_DEVICES |
                 DISSECT_IMAGE_ALLOW_USERSPACE_VERITY;
 
-        /* Note that we don't use loop_device_make here, as the FD is most likely O_PATH which would not be
-         * accepted by LOOP_CONFIGURE, so just let loop_device_make_by_path reopen it as a regular FD. */
-        r = loop_device_make_by_path(
-                        src_fd >= 0 ? FORMAT_PROC_FD_PATH(src_fd) : src,
-                        /* open_flags= */ -1,
-                        /* sector_size= */ UINT32_MAX,
-                        verity->data_path ? 0 : LO_FLAGS_PARTSCAN,
-                        LOCK_SH,
-                        &loop_device);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to create loop device for image: %m");
+        if (mount_fd >= 0) {
+                r = dissected_image_new(src, &dissected_image);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to create dissected image: %m");
 
-        r = dissect_loop_device(
-                        loop_device,
-                        verity,
-                        options,
-                        image_policy,
-                        image_filter,
-                        dissect_image_flags,
-                        &dissected_image);
-        /* No partition table? Might be a single-filesystem image, try again */
-        if (!verity->data_path && r == -ENOPKG)
-                 r = dissect_loop_device(
+                dissected_image->single_file_system = true;
+                dissected_image->partitions[PARTITION_ROOT] = (DissectedPartition) {
+                        .found = true,
+                        .partno = -1,
+                        .architecture = _ARCHITECTURE_INVALID,
+                        .size = UINT64_MAX,
+                        .mount_node_fd = -EBADF,
+                        .fsmount_fd = fcntl(mount_fd, F_DUPFD_CLOEXEC, 3),
+                };
+                if (dissected_image->partitions[PARTITION_ROOT].fsmount_fd < 0)
+                        return log_debug_errno(errno, "Failed to duplicate mount FD: %m");
+        } else {
+                /* Note that we don't use loop_device_make here, as the FD is most likely O_PATH which would not be
+                * accepted by LOOP_CONFIGURE, so just let loop_device_make_by_path reopen it as a regular FD. */
+                r = loop_device_make_by_path(
+                                src_fd >= 0 ? FORMAT_PROC_FD_PATH(src_fd) : src,
+                                /* open_flags= */ -1,
+                                /* sector_size= */ UINT32_MAX,
+                                verity->data_path ? 0 : LO_FLAGS_PARTSCAN,
+                                LOCK_SH,
+                                &loop_device);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to create loop device for image: %m");
+
+                r = dissect_loop_device(
                                 loop_device,
                                 verity,
                                 options,
                                 image_policy,
                                 image_filter,
-                                dissect_image_flags | DISSECT_IMAGE_NO_PARTITION_TABLE,
+                                dissect_image_flags,
                                 &dissected_image);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to dissect image: %m");
+                /* No partition table? Might be a single-filesystem image, try again */
+                if (!verity->data_path && r == -ENOPKG)
+                        r = dissect_loop_device(
+                                        loop_device,
+                                        verity,
+                                        options,
+                                        image_policy,
+                                        image_filter,
+                                        dissect_image_flags | DISSECT_IMAGE_NO_PARTITION_TABLE,
+                                        &dissected_image);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to dissect image: %m");
 
-        r = dissected_image_load_verity_sig_partition(dissected_image, loop_device->fd, verity);
-        if (r < 0)
-                return r;
+                r = dissected_image_load_verity_sig_partition(dissected_image, loop_device->fd, verity);
+                if (r < 0)
+                        return r;
 
-        r = dissected_image_guess_verity_roothash(dissected_image, verity);
-        if (r < 0)
-                return r;
+                r = dissected_image_guess_verity_roothash(dissected_image, verity);
+                if (r < 0)
+                        return r;
 
-        r = dissected_image_decrypt(
-                        dissected_image,
-                        NULL,
-                        verity,
-                        dissect_image_flags);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to decrypt dissected image: %m");
+                r = dissected_image_decrypt(
+                                dissected_image,
+                                NULL,
+                                verity,
+                                dissect_image_flags);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to decrypt dissected image: %m");
+        }
 
         if (dest) {
                 r = mkdir_p_label(dest, 0755);
@@ -4390,9 +4410,11 @@ int verity_dissect_and_mount(
         if (r < 0)
                 return log_debug_errno(r, "Failed to mount image: %m");
 
-        r = loop_device_flock(loop_device, LOCK_UN);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to unlock loopback device: %m");
+        if (mount_fd < 0) {
+                r = loop_device_flock(loop_device, LOCK_UN);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to unlock loopback device: %m");
+        }
 
         /* If we got os-release values from the caller, then we need to match them with the image's
          * extension-release.d/ content. Return -EINVAL if there's any mismatch.
@@ -4435,9 +4457,11 @@ int verity_dissect_and_mount(
                 }
         }
 
-        r = dissected_image_relinquish(dissected_image);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to relinquish dissected image: %m");
+        if (mount_fd < 0) {
+                r = dissected_image_relinquish(dissected_image);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to relinquish dissected image: %m");
+        }
 
         if (ret_image)
                 *ret_image = TAKE_PTR(dissected_image);

@@ -5304,6 +5304,7 @@ int config_parse_mount_images(
                 r = mount_image_add(&c->mount_images, &c->n_mount_images,
                                     &(MountImage) {
                                             .source = sresolved,
+                                            .source_fd = -EBADF,
                                             .destination = dresolved,
                                             .mount_options = options,
                                             .ignore_enoent = permissive,
@@ -5445,6 +5446,7 @@ int config_parse_extension_images(
                 r = mount_image_add(&c->extension_images, &c->n_extension_images,
                                     &(MountImage) {
                                             .source = sresolved,
+                                            .source_fd = -EBADF,
                                             .mount_options = options,
                                             .ignore_enoent = permissive,
                                             .type = MOUNT_IMAGE_EXTENSION,

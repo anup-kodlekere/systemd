@@ -108,6 +108,7 @@ typedef struct MountEntry {
         char *unprefixed_path_malloc;
         const char *source_const; /* The source path, for bind mounts or images */
         char *source_malloc;
+        int source_fd;            /* Images can be pre-mounted to reduce downtime */
         const char *options_const;/* Mount options for tmpfs */
         char *options_malloc;
         unsigned long flags;      /* Mount flags used by EMPTY_DIR and TMPFS. Do not include MS_RDONLY here, but please use read_only. */
@@ -425,6 +426,7 @@ static int append_access_mounts(MountList *ml, char **strv, MountMode mode, bool
                         .mode = mode,
                         .ignore = ignore,
                         .has_prefix = !needs_prefix && !forcibly_require_prefix,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -449,6 +451,7 @@ static int append_empty_dir_mounts(MountList *ml, char **strv) {
                         .read_only = true,
                         .options_const = "mode=0755" TMPFS_LIMITS_EMPTY_OR_ALMOST,
                         .flags = MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -472,6 +475,7 @@ static int append_bind_mounts(MountList *ml, const BindMount *binds, size_t n) {
                         .noexec = b->noexec,
                         .flags = b->nodev ? MS_NODEV : 0,
                         .source_const = b->source,
+                        .source_fd = -EBADF,
                         .ignore = b->ignore_enoent,
                         .idmapped = b->idmapped,
                         .idmap_uid = b->uid,
@@ -490,18 +494,26 @@ static int append_mount_images(MountList *ml, const MountImage *mount_images, si
 
         FOREACH_ARRAY(m, mount_images, n) {
                 _cleanup_(verity_settings_done) VeritySettings verity = VERITY_SETTINGS_DEFAULT;
+                _cleanup_close_ int source_fd = -EBADF;
                 MountEntry *me = mount_list_extend(ml);
                 if (!me)
                         return log_oom_debug();
 
-                r = verity_settings_load(&verity, m->source, /* root_hash_path= */ NULL, /* root_hash_sig_path= */ NULL);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to check verity root hash of %s: %m", m->source);
+                if (m->source_fd >= 0) {
+                        source_fd = fcntl(m->source_fd, F_DUPFD_CLOEXEC, 3);
+                        if (source_fd < 0)
+                                return log_debug_errno(errno, "Failed to duplicate source fd %d: %m", m->source_fd);
+                } else {
+                        r = verity_settings_load(&verity, m->source, /* root_hash_path= */ NULL, /* root_hash_sig_path= */ NULL);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to check verity root hash of %s: %m", m->source);
+                }
 
                 *me = (MountEntry) {
                         .path_const = m->destination,
                         .mode = MOUNT_IMAGE,
                         .source_const = m->source,
+                        .source_fd = TAKE_FD(source_fd),
                         .image_options_const = m->mount_options,
                         .ignore = m->ignore_enoent,
                         .verity = TAKE_GENERIC(verity, VeritySettings, VERITY_SETTINGS_DEFAULT),
@@ -552,31 +564,40 @@ static int append_extensions(
                 _cleanup_(verity_settings_done) VeritySettings verity = VERITY_SETTINGS_DEFAULT;
                 _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
                 _cleanup_free_ char *mount_point = NULL;
+                _cleanup_close_ int source_fd = -EBADF;
                 const MountImage *m = mount_images + i;
 
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
-                              m->source,
-                              &pick_filter_image_raw,
-                              PICK_ARCHITECTURE|PICK_TRIES,
-                              &result);
-                if (r == -ENOENT && m->ignore_enoent)
-                        continue;
-                if (r < 0)
-                        return r;
-                if (!result.path) {
-                        if (m->ignore_enoent)
+                if (m->source_fd >= 0) {
+                        assert(!endswith(m->source, ".v") && !endswith(m->source, ".v/"));
+
+                        source_fd = fcntl(m->source_fd, F_DUPFD_CLOEXEC, 3);
+                        if (source_fd < 0)
+                                return log_debug_errno(errno, "Failed to duplicate source fd %d: %m", m->source_fd);
+                } else {
+                        r = path_pick(/* toplevel_path= */ NULL,
+                                /* toplevel_fd= */ AT_FDCWD,
+                                m->source,
+                                &pick_filter_image_raw,
+                                PICK_ARCHITECTURE|PICK_TRIES,
+                                &result);
+                        if (r == -ENOENT && m->ignore_enoent)
                                 continue;
+                        if (r < 0)
+                                return r;
+                        if (!result.path) {
+                                if (m->ignore_enoent)
+                                        continue;
 
-                        return log_debug_errno(
-                                        SYNTHETIC_ERRNO(ENOENT),
-                                        "No matching entry in .v/ directory %s found.",
-                                        m->source);
+                                return log_debug_errno(
+                                                SYNTHETIC_ERRNO(ENOENT),
+                                                "No matching entry in .v/ directory %s found.",
+                                                m->source);
+                        }
+
+                        r = verity_settings_load(&verity, result.path, /* root_hash_path= */ NULL, /* root_hash_sig_path= */ NULL);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to check verity root hash of %s: %m", result.path);
                 }
-
-                r = verity_settings_load(&verity, result.path, /* root_hash_path= */ NULL, /* root_hash_sig_path= */ NULL);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to check verity root hash of %s: %m", result.path);
 
                 if (asprintf(&mount_point, "%s/unit-extensions/%zu", private_namespace_dir, i) < 0)
                         return -ENOMEM;
@@ -600,6 +621,7 @@ static int append_extensions(
                         .image_options_const = m->mount_options,
                         .ignore = m->ignore_enoent,
                         .source_malloc = TAKE_PTR(result.path),
+                        .source_fd = TAKE_FD(source_fd),
                         .mode = MOUNT_EXTENSION_IMAGE,
                         .has_prefix = true,
                         .verity = TAKE_GENERIC(verity, VeritySettings, VERITY_SETTINGS_DEFAULT),
@@ -666,6 +688,7 @@ static int append_extensions(
                 *me = (MountEntry) {
                         .path_malloc = TAKE_PTR(mount_point),
                         .source_malloc = TAKE_PTR(result.path),
+                        .source_fd = -EBADF,
                         .mode = MOUNT_EXTENSION_DIRECTORY,
                         .ignore = ignore_enoent,
                         .has_prefix = true,
@@ -689,6 +712,7 @@ static int append_extensions(
 
                 *me = (MountEntry) {
                         .path_malloc = TAKE_PTR(prefixed_hierarchy),
+                        .source_fd = -EBADF,
                         .overlay_layers = TAKE_PTR(overlays[i]),
                         .mode = MOUNT_OVERLAY,
                         .has_prefix = true,
@@ -733,6 +757,7 @@ static int append_tmpfs_mounts(MountList *ml, const TemporaryFileSystem *tmpfs, 
                         .read_only = ro,
                         .options_malloc = TAKE_PTR(o),
                         .flags = flags,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -758,6 +783,7 @@ static int append_private_tmp(MountList *ml, const NamespaceParameters *p) {
                         .mode = MOUNT_PRIVATE_TMP,
                         .read_only = streq(p->tmp_dir, RUN_SYSTEMD_EMPTY),
                         .source_const = p->tmp_dir,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -772,6 +798,7 @@ static int append_private_tmp(MountList *ml, const NamespaceParameters *p) {
                         .mode = MOUNT_PRIVATE_TMP,
                         .read_only = streq(p->var_tmp_dir, RUN_SYSTEMD_EMPTY),
                         .source_const = p->var_tmp_dir,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -787,6 +814,7 @@ static int append_private_tmp(MountList *ml, const NamespaceParameters *p) {
                         .mode = MOUNT_PRIVATE_TMPFS,
                         .options_const = "mode=0700" NESTED_TMPFS_LIMITS,
                         .flags = MS_NODEV|MS_STRICTATIME,
+                        .source_fd = -EBADF,
                 };
 
                 return 0;
@@ -808,6 +836,7 @@ static int append_private_tmp(MountList *ml, const NamespaceParameters *p) {
                 .options_const = "mode=0700" NESTED_TMPFS_LIMITS,
                 .flags = MS_NODEV|MS_STRICTATIME,
                 .has_prefix = true,
+                .source_fd = -EBADF,
         };
 
         me = mount_list_extend(ml);
@@ -819,6 +848,7 @@ static int append_private_tmp(MountList *ml, const NamespaceParameters *p) {
                 .mode = MOUNT_BIND,
                 .source_dir_mode = 01777,
                 .create_source_dir = true,
+                .source_fd = -EBADF,
         };
 
         me = mount_list_extend(ml);
@@ -830,6 +860,7 @@ static int append_private_tmp(MountList *ml, const NamespaceParameters *p) {
                 .mode = MOUNT_BIND,
                 .source_dir_mode = 01777,
                 .create_source_dir = true,
+                .source_fd = -EBADF,
         };
 
         return 0;
@@ -1611,6 +1642,7 @@ static int mount_image(
 
         r = verity_dissect_and_mount(
                         /* src_fd= */ -EBADF,
+                        m->source_fd,
                         mount_entry_source(m),
                         mount_entry_path(m),
                         m->image_options_const,
@@ -2456,47 +2488,65 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                 if (p->runtime_scope == RUNTIME_SCOPE_SYSTEM) {
                         /* In system mode we mount directly */
 
-                        r = loop_device_make_by_path(
-                                        p->root_image,
-                                        FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
-                                        /* sector_size= */ UINT32_MAX,
-                                        FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
-                                        LOCK_SH,
-                                        &loop_device);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to create loop device for root image: %m");
+                        if (p->root_image_fd >= 0) {
+                                r = dissected_image_new(p->root_image, &dissected_image);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to create dissected image: %m");
 
-                        r = dissect_loop_device(
-                                        loop_device,
-                                        p->verity,
-                                        p->root_image_options,
-                                        p->root_image_policy,
-                                        /* image_filter= */ NULL,
-                                        dissect_image_flags,
-                                        &dissected_image);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to dissect image: %m");
+                                dissected_image->single_file_system = true;
+                                dissected_image->partitions[PARTITION_ROOT] = (DissectedPartition) {
+                                        .found = true,
+                                        .partno = -1,
+                                        .architecture = _ARCHITECTURE_INVALID,
+                                        .size = UINT64_MAX,
+                                        .mount_node_fd = -EBADF,
+                                        .fsmount_fd = fcntl(p->root_image_fd, F_DUPFD_CLOEXEC, 3),
+                                };
+                                if (dissected_image->partitions[PARTITION_ROOT].fsmount_fd < 0)
+                                        return log_debug_errno(errno, "Failed to duplicate mount FD: %m");
+                        } else {
+                                r = loop_device_make_by_path(
+                                                p->root_image,
+                                                FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
+                                                /* sector_size= */ UINT32_MAX,
+                                                FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
+                                                LOCK_SH,
+                                                &loop_device);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to create loop device for root image: %m");
 
-                        r = dissected_image_load_verity_sig_partition(
-                                        dissected_image,
-                                        loop_device->fd,
-                                        p->verity);
-                        if (r < 0)
-                                return r;
+                                r = dissect_loop_device(
+                                                loop_device,
+                                                p->verity,
+                                                p->root_image_options,
+                                                p->root_image_policy,
+                                                /* image_filter= */ NULL,
+                                                dissect_image_flags,
+                                                &dissected_image);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to dissect image: %m");
 
-                        r = dissected_image_guess_verity_roothash(
-                                        dissected_image,
-                                        p->verity);
-                        if (r < 0)
-                                return r;
+                                r = dissected_image_load_verity_sig_partition(
+                                                dissected_image,
+                                                loop_device->fd,
+                                                p->verity);
+                                if (r < 0)
+                                        return r;
 
-                        r = dissected_image_decrypt(
-                                        dissected_image,
-                                        NULL,
-                                        p->verity,
-                                        dissect_image_flags);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to decrypt dissected image: %m");
+                                r = dissected_image_guess_verity_roothash(
+                                                dissected_image,
+                                                p->verity);
+                                if (r < 0)
+                                        return r;
+
+                                r = dissected_image_decrypt(
+                                                dissected_image,
+                                                NULL,
+                                                p->verity,
+                                                dissect_image_flags);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to decrypt dissected image: %m");
+                        }
                 } else {
                         userns_fd = namespace_open_by_type(NAMESPACE_USER);
                         if (userns_fd < 0)
@@ -2593,6 +2643,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .path_const = "/dev",
                         .mode = MOUNT_PRIVATE_DEV,
                         .flags = DEV_MOUNT_OPTIONS,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -2684,6 +2735,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                 *me = (MountEntry) {
                         .path_const = "/sys",
                         .mode = MOUNT_PRIVATE_SYSFS,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -2696,6 +2748,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .path_const = "/dev/mqueue",
                         .mode = MOUNT_MQUEUEFS,
                         .flags = MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -2713,6 +2766,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .read_only = true,
                         .options_const = "mode=0755" TMPFS_LIMITS_EMPTY_OR_ALMOST,
                         .flags = MS_NODEV|MS_STRICTATIME|MS_NOSUID|MS_NOEXEC,
+                        .source_fd = -EBADF,
                 };
 
                 me = mount_list_extend(&ml);
@@ -2725,6 +2779,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .read_only = true,
                         .source_const = p->creds_path,
                         .ignore = true,
+                        .source_fd = -EBADF,
                 };
         } else {
                 /* If our service has no credentials store configured, then make the whole credentials tree
@@ -2738,6 +2793,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .path_const = "/run/credentials",
                         .mode = MOUNT_INACCESSIBLE,
                         .ignore = true,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -2757,6 +2813,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .mode = MOUNT_BIND_RECURSIVE,
                         .read_only = true,
                         .source_malloc = TAKE_PTR(q),
+                        .source_fd = -EBADF,
                 };
 
         } else if (p->bind_log_sockets) {
@@ -2776,6 +2833,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .path_const = p->incoming_dir,
                         .mode = MOUNT_BIND,
                         .read_only = true,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -2789,6 +2847,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .source_const = p->host_notify_socket,
                         .mode = MOUNT_BIND,
                         .read_only = true,
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -2803,6 +2862,7 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                         .mode = MOUNT_BIND,
                         .read_only = true,
                         .ignore = true, /* Live copy, don't hard-fail if it goes missing */
+                        .source_fd = -EBADF,
                 };
         }
 
@@ -2857,17 +2917,19 @@ int setup_namespace(const NamespaceParameters *p, char **reterr_path) {
                 if (r < 0)
                         return log_debug_errno(r, "Failed to mount root image: %m");
 
-                /* Now release the block device lock, so that udevd is free to call BLKRRPART on the device
-                 * if it likes. */
-                if (loop_device) {
-                        r = loop_device_flock(loop_device, LOCK_UN);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to release lock on loopback block device: %m");
-                }
+                if (p->root_image_fd >= 0) {
+                        /* Now release the block device lock, so that udevd is free to call BLKRRPART on the device
+                        * if it likes. */
+                        if (loop_device) {
+                                r = loop_device_flock(loop_device, LOCK_UN);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to release lock on loopback block device: %m");
+                        }
 
-                r = dissected_image_relinquish(dissected_image);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to relinquish dissected image: %m");
+                        r = dissected_image_relinquish(dissected_image);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to relinquish dissected image: %m");
+                }
 
         } else if (p->root_directory) {
 
@@ -2986,6 +3048,7 @@ MountImage* mount_image_free_many(MountImage *m, size_t *n) {
 
 int mount_image_add(MountImage **m, size_t *n, const MountImage *item) {
         _cleanup_free_ char *s = NULL, *d = NULL;
+        _cleanup_close_ int fd = -EBADF;
         _cleanup_(mount_options_free_allp) MountOptions *options = NULL;
 
         assert(m);
@@ -3022,8 +3085,15 @@ int mount_image_add(MountImage **m, size_t *n, const MountImage *item) {
         if (!GREEDY_REALLOC(*m, *n + 1))
                 return -ENOMEM;
 
+        if (item->source_fd >= 0) {
+                fd = fcntl(item->source_fd, F_DUPFD_CLOEXEC, 3);
+                if (fd < 0)
+                        return log_debug_errno(errno, "Failed to dup() source fd: %m");
+        }
+
         (*m)[(*n)++] = (MountImage) {
                 .source = TAKE_PTR(s),
+                .source_fd = TAKE_FD(fd),
                 .destination = TAKE_PTR(d),
                 .mount_options = TAKE_PTR(options),
                 .ignore_enoent = item->ignore_enoent,

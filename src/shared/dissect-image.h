@@ -196,6 +196,7 @@ DecryptedImage* decrypted_image_unref(DecryptedImage *p);
 DEFINE_TRIVIAL_CLEANUP_FUNC(DecryptedImage*, decrypted_image_unref);
 
 int dissected_image_relinquish(DissectedImage *m);
+int dissected_image_new(const char *path, DissectedImage **ret);
 
 void image_filter_done(ImageFilter *f);
 ImageFilter *image_filter_free(ImageFilter *f);
@@ -238,7 +239,7 @@ bool dissected_image_verity_sig_ready(const DissectedImage *image, PartitionDesi
 
 int mount_image_privately_interactively(const char *path, const ImagePolicy *image_policy, DissectImageFlags flags, char **ret_directory, int *ret_dir_fd, LoopDevice **ret_loop_device);
 
-int verity_dissect_and_mount(int src_fd, const char *src, const char *dest, const MountOptions *options, const ImagePolicy *image_policy, const ImageFilter *image_filter, const ExtensionReleaseData *required_release_data, ImageClass required_class, VeritySettings *verity, DissectedImage **ret_image);
+int verity_dissect_and_mount(int src_fd, int mount_fd, const char *src, const char *dest, const MountOptions *options, const ImagePolicy *image_policy, const ImageFilter *image_filter, const ExtensionReleaseData *required_release_data, ImageClass required_class, VeritySettings *verity, DissectedImage **ret_image);
 
 int dissect_fstype_ok(const char *fstype);
 

@@ -3353,6 +3353,8 @@ static int pick_versions(
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOENT), "No matching entry in .v/ directory %s found.", context->root_image);
                 }
 
+                assert(context->root_image_fd == -EBADF || (!endswith(context->root_image, ".v") && !endswith(context->root_image, ".v/")));
+
                 *ret_root_image = TAKE_PTR(result.path);
                 *ret_root_directory = NULL;
                 return r;
@@ -3537,6 +3539,7 @@ static int apply_mount_namespace(
                 .root_image = root_image,
                 .root_image_options = context->root_image_options,
                 .root_image_policy = context->root_image_policy ?: &image_policy_service,
+                .root_image_fd = context->root_image_fd,
 
                 .read_write_paths = read_write_paths,
                 .read_only_paths = needs_sandboxing ? context->read_only_paths : NULL,

@@ -11,6 +11,7 @@
 #include "execute-serialize.h"
 #include "extract-word.h"
 #include "fd-util.h"
+#include "fdset.h"
 #include "hexdecoct.h"
 #include "image-policy.h"
 #include "in-addr-prefix-util.h"
@@ -1613,7 +1614,7 @@ static int serialize_std_out_err(const ExecContext *c, FILE *f, int fileno) {
         return serialize_item(f, key, value);
 }
 
-static int exec_context_serialize(const ExecContext *c, FILE *f) {
+static int exec_context_serialize(const ExecContext *c, FILE *f, FDSet *fds) {
         int r;
 
         assert(f);
@@ -1654,6 +1655,10 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                 return r;
 
         r = serialize_item_escaped(f, "exec-context-root-image", c->root_image);
+        if (r < 0)
+                return r;
+
+        r = serialize_fd(f, fds, "exec-context-root-image-fd", c->root_image_fd);
         if (r < 0)
                 return r;
 
@@ -2413,6 +2418,18 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
                 if (!s)
                         return log_oom_debug();
 
+                if (mount->source_fd >= 0) {
+                        int copy = fdset_put_dup(fds, mount->source_fd);
+                        if (copy < 0)
+                                return copy;
+
+                        if (!strextendf(&s, " %i", copy))
+                                return log_oom_debug();
+                } else {
+                        if (!strextend(&s, " -EBADF"))
+                                return log_oom_debug();
+                }
+
                 LIST_FOREACH(mount_options, o, mount->mount_options) {
                         _cleanup_free_ char *escaped = NULL;
 
@@ -2486,7 +2503,7 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         return 0;
 }
 
-static int exec_context_deserialize(ExecContext *c, FILE *f) {
+static int exec_context_deserialize(ExecContext *c, FILE *f, FDSet *fds) {
         int r;
 
         assert(f);
@@ -2544,6 +2561,14 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (k < 0)
                                 return k;
                         free_and_replace(c->root_image, p);
+                } else if ((val = startswith(l, "exec-context-root-fd="))) {
+                        int fd;
+
+                        fd = deserialize_fd(fds, val);
+                        if (fd < 0)
+                                continue;
+
+                        close_and_replace(c->root_image_fd, fd);
                 } else if ((val = startswith(l, "exec-context-root-image-options="))) {
                         for (;;) {
                                 _cleanup_free_ char *word = NULL, *mount_options = NULL, *partition = NULL;
@@ -3497,6 +3522,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         r = mount_image_add(&c->mount_images, &c->n_mount_images,
                                         &(MountImage) {
                                                 .source = s,
+                                                .source_fd = -EBADF,
                                                 .destination = destination,
                                                 .mount_options = options,
                                                 .ignore_enoent = permissive,
@@ -3506,14 +3532,16 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                                 return log_oom_debug();
                 } else if ((val = startswith(l, "exec-context-extension-image="))) {
                         _cleanup_(mount_options_free_allp) MountOptions *options = NULL;
-                        _cleanup_free_ char *source = NULL;
+                        _cleanup_free_ char *source = NULL, *source_fd = NULL;
+                        _cleanup_close_ int fd = -EBADF;
                         bool permissive = false;
                         char *s;
 
-                        r = extract_first_word(&val,
-                                               &source,
+                        r = extract_many_words(&val,
                                                NULL,
-                                               EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS);
+                                               EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS,
+                                               &source,
+                                               &source_fd);
                         if (r < 0)
                                 return r;
                         if (r == 0)
@@ -3523,6 +3551,16 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (s[0] == '-') {
                                 permissive = true;
                                 s++;
+                        }
+
+                        /* Unlike other FDs which are just skipped when not used, there are other settings
+                         * after this one so -EBADF is sent if unset. It can also be missing, between the
+                         * time when systemd-executor and systemd are unpacked on update, and when pid1 is
+                         * re-exec'ed. */
+                        if (!isempty(source_fd) && !streq(source_fd, "-EBADF")) {
+                                fd = deserialize_fd(fds, source_fd);
+                                if (fd < 0)
+                                        return fd;
                         }
 
                         for (;;) {
@@ -3577,6 +3615,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         r = mount_image_add(&c->extension_images, &c->n_extension_images,
                                         &(MountImage) {
                                                 .source = s,
+                                                .source_fd = TAKE_FD(fd),
                                                 .mount_options = options,
                                                 .ignore_enoent = permissive,
                                                 .type = MOUNT_IMAGE_EXTENSION,
@@ -3740,7 +3779,7 @@ int exec_serialize_invocation(
         assert(f);
         assert(fds);
 
-        r = exec_context_serialize(ctx, f);
+        r = exec_context_serialize(ctx, f, fds);
         if (r < 0)
                 return log_debug_errno(r, "Failed to serialize context: %m");
 
@@ -3777,7 +3816,7 @@ int exec_deserialize_invocation(
         assert(f);
         assert(fds);
 
-        r = exec_context_deserialize(ctx, f);
+        r = exec_context_deserialize(ctx, f, fds);
         if (r < 0)
                 return log_debug_errno(r, "Failed to deserialize context: %m");
 

@@ -687,6 +687,7 @@ void exec_context_done(ExecContext *c) {
         c->root_directory = mfree(c->root_directory);
         c->root_image = mfree(c->root_image);
         c->root_image_options = mount_options_free_all(c->root_image_options);
+        c->root_image_fd = safe_close(c->root_image_fd);
         c->root_hash = mfree(c->root_hash);
         c->root_hash_size = 0;
         c->root_hash_path = mfree(c->root_hash_path);

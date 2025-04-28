@@ -71,6 +71,7 @@ static const UnitActiveState state_translation_table[_SERVICE_STATE_MAX] = {
         [SERVICE_RELOAD_NOTIFY]              = UNIT_RELOADING,
         [SERVICE_REFRESH_EXTENSIONS]         = UNIT_REFRESHING,
         [SERVICE_MOUNTING]                   = UNIT_REFRESHING,
+        [SERVICE_IMAGE_PRELOAD]              = UNIT_REFRESHING,
         [SERVICE_STOP]                       = UNIT_DEACTIVATING,
         [SERVICE_STOP_WATCHDOG]              = UNIT_DEACTIVATING,
         [SERVICE_STOP_SIGTERM]               = UNIT_DEACTIVATING,
@@ -103,6 +104,7 @@ static const UnitActiveState state_translation_table_idle[_SERVICE_STATE_MAX] = 
         [SERVICE_RELOAD_NOTIFY]              = UNIT_RELOADING,
         [SERVICE_REFRESH_EXTENSIONS]         = UNIT_REFRESHING,
         [SERVICE_MOUNTING]                   = UNIT_REFRESHING,
+        [SERVICE_IMAGE_PRELOAD]              = UNIT_REFRESHING,
         [SERVICE_STOP]                       = UNIT_DEACTIVATING,
         [SERVICE_STOP_WATCHDOG]              = UNIT_DEACTIVATING,
         [SERVICE_STOP_SIGTERM]               = UNIT_DEACTIVATING,
@@ -133,7 +135,7 @@ static bool SERVICE_STATE_WITH_MAIN_PROCESS(ServiceState state) {
                       SERVICE_START, SERVICE_START_POST,
                       SERVICE_RUNNING,
                       SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY, SERVICE_REFRESH_EXTENSIONS,
-                      SERVICE_MOUNTING,
+                      SERVICE_MOUNTING, SERVICE_IMAGE_PRELOAD,
                       SERVICE_STOP, SERVICE_STOP_WATCHDOG, SERVICE_STOP_SIGTERM, SERVICE_STOP_SIGKILL, SERVICE_STOP_POST,
                       SERVICE_FINAL_WATCHDOG, SERVICE_FINAL_SIGTERM, SERVICE_FINAL_SIGKILL);
 }
@@ -143,7 +145,7 @@ static bool SERVICE_STATE_WITH_CONTROL_PROCESS(ServiceState state) {
                       SERVICE_CONDITION,
                       SERVICE_START_PRE, SERVICE_START, SERVICE_START_POST,
                       SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY, SERVICE_REFRESH_EXTENSIONS,
-                      SERVICE_MOUNTING,
+                      SERVICE_MOUNTING, SERVICE_IMAGE_PRELOAD,
                       SERVICE_STOP, SERVICE_STOP_WATCHDOG, SERVICE_STOP_SIGTERM, SERVICE_STOP_SIGKILL, SERVICE_STOP_POST,
                       SERVICE_FINAL_WATCHDOG, SERVICE_FINAL_SIGTERM, SERVICE_FINAL_SIGKILL,
                       SERVICE_CLEANING);
@@ -1277,7 +1279,7 @@ static void service_set_state(Service *s, ServiceState state) {
                     SERVICE_CONDITION, SERVICE_START_PRE, SERVICE_START, SERVICE_START_POST,
                     SERVICE_RUNNING,
                     SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY, SERVICE_REFRESH_EXTENSIONS,
-                    SERVICE_MOUNTING,
+                    SERVICE_MOUNTING, SERVICE_IMAGE_PRELOAD,
                     SERVICE_STOP, SERVICE_STOP_WATCHDOG, SERVICE_STOP_SIGTERM, SERVICE_STOP_SIGKILL, SERVICE_STOP_POST,
                     SERVICE_FINAL_WATCHDOG, SERVICE_FINAL_SIGTERM, SERVICE_FINAL_SIGKILL,
                     SERVICE_AUTO_RESTART,
@@ -1304,7 +1306,7 @@ static void service_set_state(Service *s, ServiceState state) {
         if (state != SERVICE_START)
                 s->exec_fd_event_source = sd_event_source_disable_unref(s->exec_fd_event_source);
 
-        if (!IN_SET(state, SERVICE_START_POST, SERVICE_RUNNING, SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY, SERVICE_REFRESH_EXTENSIONS, SERVICE_MOUNTING))
+        if (!IN_SET(state, SERVICE_START_POST, SERVICE_RUNNING, SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY, SERVICE_REFRESH_EXTENSIONS, SERVICE_MOUNTING, SERVICE_IMAGE_PRELOAD))
                 service_stop_watchdog(s);
 
         if (state != SERVICE_MOUNTING) /* Just in case */
@@ -1351,6 +1353,7 @@ static usec_t service_coldplug_timeout(Service *s) {
         case SERVICE_RELOAD_NOTIFY:
         case SERVICE_REFRESH_EXTENSIONS:
         case SERVICE_MOUNTING:
+        case SERVICE_IMAGE_PRELOAD:
                 return usec_add(UNIT(s)->state_change_timestamp.monotonic, s->timeout_start_usec);
 
         case SERVICE_RUNNING:
@@ -1416,7 +1419,7 @@ static int service_coldplug(Unit *u) {
                     SERVICE_DEAD_RESOURCES_PINNED))
                 (void) unit_setup_exec_runtime(u);
 
-        if (IN_SET(s->deserialized_state, SERVICE_START_POST, SERVICE_RUNNING, SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY, SERVICE_REFRESH_EXTENSIONS, SERVICE_MOUNTING))
+        if (IN_SET(s->deserialized_state, SERVICE_START_POST, SERVICE_RUNNING, SERVICE_RELOAD, SERVICE_RELOAD_SIGNAL, SERVICE_RELOAD_NOTIFY, SERVICE_REFRESH_EXTENSIONS, SERVICE_IMAGE_PRELOAD))
                 service_start_watchdog(s);
 
         if (UNIT_ISSET(s->accept_socket)) {
@@ -2821,6 +2824,7 @@ static void service_enter_refresh_extensions(Service *s) {
                         .n_extension_images = s->exec_context.n_extension_images,
                         .extension_directories = s->exec_context.extension_directories,
                         .extension_image_policy = s->exec_context.extension_image_policy,
+                        .root_image_fd = -EBADF,
                 };
 
                 /* Only reload confext, and not sysext as they also typically contain the executable(s) used
@@ -3031,6 +3035,13 @@ static void service_live_mount_finish(Service *s, ServiceResult f, const char *e
         s->mount_request = sd_bus_message_unref(s->mount_request);
 }
 
+static int service_enter_image_preload(Service *s) {
+
+        service_set_state(s, SERVICE_IMAGE_PRELOAD);
+        // XXX fill
+        return 1;
+}
+
 static int service_stop(Unit *u) {
         Service *s = ASSERT_PTR(SERVICE(u));
 
@@ -3055,6 +3066,8 @@ static int service_stop(Unit *u) {
                 service_set_state(s, service_determine_dead_state(s));
                 return 0;
 
+        case SERVICE_IMAGE_PRELOAD:
+                // FIXME
         case SERVICE_MOUNTING:
                 service_live_mount_finish(s, SERVICE_FAILURE_PROTOCOL, BUS_ERROR_UNIT_INACTIVE);
                 _fallthrough_;
@@ -3079,6 +3092,11 @@ static int service_stop(Unit *u) {
                 return 0;
 
         case SERVICE_RUNNING:
+                if (u->job->type == JOB_RESTART) {
+                        service_enter_image_preload(s);
+                        return 1;
+                }
+                _fallthrough_;
         case SERVICE_EXITED:
                 service_enter_stop(s, SERVICE_SUCCESS);
                 return 1;
@@ -4098,6 +4116,7 @@ static void service_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                                 case SERVICE_RELOAD_NOTIFY:
                                 case SERVICE_REFRESH_EXTENSIONS:
                                 case SERVICE_MOUNTING:
+                                case SERVICE_IMAGE_PRELOAD:
                                         /* If neither main nor control processes are running then the current
                                          * state can never exit cleanly, hence immediately terminate the
                                          * service. */
@@ -4212,7 +4231,7 @@ static void service_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                                 success,
                                 code, status);
 
-                if (!IN_SET(s->state, SERVICE_RELOAD, SERVICE_MOUNTING) && s->result == SERVICE_SUCCESS)
+                if (!IN_SET(s->state, SERVICE_RELOAD, SERVICE_MOUNTING, SERVICE_IMAGE_PRELOAD /* XXX double check */) && s->result == SERVICE_SUCCESS)
                         s->result = f;
 
                 if (s->control_command &&
@@ -4329,6 +4348,11 @@ static void service_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                                 service_enter_running(s, SERVICE_SUCCESS);
                                 break;
 
+                        case SERVICE_IMAGE_PRELOAD:
+                                /* Preloading images asynchronously done, proceed to restart */
+                                service_enter_stop(s, SERVICE_SUCCESS);
+                                break;
+
                         case SERVICE_STOP:
                                 service_enter_signal(s, SERVICE_STOP_SIGTERM, f);
                                 break;
@@ -4433,6 +4457,12 @@ static int service_dispatch_timer(sd_event_source *source, usec_t usec, void *us
                 service_kill_control_process(s);
                 service_live_mount_finish(s, SERVICE_FAILURE_TIMEOUT, SD_BUS_ERROR_TIMEOUT);
                 service_enter_running(s, SERVICE_SUCCESS);
+                break;
+
+        case SERVICE_IMAGE_PRELOAD:
+                log_unit_info(UNIT(s), "Image preloading operation timed out. Skipping to restart.");
+                service_kill_control_process(s);
+                service_enter_stop(s, SERVICE_SUCCESS);
                 break;
 
         case SERVICE_STOP:
@@ -5100,7 +5130,8 @@ static bool pick_up_pid_from_bus_name(Service *s) {
                        SERVICE_RELOAD_SIGNAL,
                        SERVICE_RELOAD_NOTIFY,
                        SERVICE_REFRESH_EXTENSIONS,
-                       SERVICE_MOUNTING);
+                       SERVICE_MOUNTING,
+                       SERVICE_IMAGE_PRELOAD);
 }
 
 static int bus_name_pid_lookup_callback(sd_bus_message *reply, void *userdata, sd_bus_error *ret_error) {
@@ -5286,6 +5317,7 @@ static bool service_needs_console(Unit *u) {
                       SERVICE_RELOAD_NOTIFY,
                       SERVICE_REFRESH_EXTENSIONS,
                       SERVICE_MOUNTING,
+                      SERVICE_IMAGE_PRELOAD,
                       SERVICE_STOP,
                       SERVICE_STOP_WATCHDOG,
                       SERVICE_STOP_SIGTERM,
