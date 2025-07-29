@@ -5,10 +5,8 @@
 name: mkosi
 
 on:
+  workflow_dispatch:
   push:
-    branches:
-      - main
-      - v[0-9]+-stable
     paths:
       - "**"
       - "!README*"
