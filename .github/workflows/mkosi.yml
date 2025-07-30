@@ -85,7 +85,7 @@ jobs:
             no_kvm: 1
           - distro: debian
             release: testing
-            runner: ub24ppc
+            runner: self-hosted
             sanitizers: ""
             llvm: 0
             cflags: "-Og"
